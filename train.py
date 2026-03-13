@@ -17,11 +17,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+try:
+    from kernels import get_kernel
+except ImportError:
+    get_kernel = None
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -90,7 +89,27 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if self.n_kv_head != self.n_head:
+            kv_repeat = self.n_head // self.n_kv_head
+            k = k.repeat_interleave(kv_repeat, dim=2)
+            v = v.repeat_interleave(kv_repeat, dim=2)
+
+        if ATTN_BACKEND == "fa3":
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            is_local = window_size[0] < MAX_SEQ_LEN
+            if is_local:
+                w = window_size[0]
+                attn_mask = torch.ones((T, T), dtype=torch.bool, device=q.device).triu(1)
+                local_mask = torch.ones((T, T), dtype=torch.bool, device=q.device).tril(-(w - 1))
+                attn_mask = attn_mask | local_mask
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)
+            y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -459,8 +478,34 @@ torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+cap = torch.cuda.get_device_capability()
+major, minor = cap
+
+if get_kernel is not None:
+    try:
+        # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+        repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+        fa3 = get_kernel(repo).flash_attn_interface
+    except Exception:
+        fa3 = None
+else:
+    fa3 = None
+
+ATTN_BACKEND = "fa3" if fa3 is not None else "sdpa"
+compute_dtype = torch.bfloat16 if major >= 8 else torch.float16
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=compute_dtype)
+USE_TORCH_COMPILE = os.environ.get("AR_DISABLE_COMPILE", "0") != "1" and major >= 7
 H100_BF16_PEAK_FLOPS = 989.5e12
+
+if os.environ.get("AR_LOW_VRAM_PRESET", "0") == "1":
+    print("Applying AR_LOW_VRAM_PRESET hyperparameters")
+    WINDOW_PATTERN = "L"
+    TOTAL_BATCH_SIZE = 2**14
+    EMBEDDING_LR = 0.3
+    MATRIX_LR = 0.02
+    WEIGHT_DECAY = 0.05
+    DEPTH = 4
+    DEVICE_BATCH_SIZE = 4
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -505,7 +550,8 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+if USE_TORCH_COMPILE:
+    model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -628,3 +674,6 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+print(f"attention_backend:{ATTN_BACKEND}")
+print(f"compute_dtype:    {compute_dtype}")
+print(f"torch_compile:    {USE_TORCH_COMPILE}")

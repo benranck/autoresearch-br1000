@@ -39,6 +39,156 @@ uv run train.py
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
+
+## Step-by-step (Windows + WSL2, from `git clone` to first successful run)
+
+If you want the safest path on WSL2, use Docker first.
+
+### 0) One-time host prerequisites (Windows side)
+
+1. Install the latest NVIDIA Windows driver for your GPU.
+2. Install Docker Desktop.
+3. In Docker Desktop, enable WSL integration for your distro.
+4. Confirm WSL2 is active (`wsl -l -v` in PowerShell).
+
+### 1) Clone and enter the repo (inside WSL)
+
+```bash
+git clone <your-fork-url>
+cd autoresearch-br1000
+```
+
+### 2) Verify GPU is visible in WSL
+
+```bash
+nvidia-smi
+```
+
+If this fails, Docker GPU runs will also fail.
+
+### 3) Run one-shot Docker flow
+
+```bash
+bash scripts/run_wsl2_docker.sh
+```
+
+What this does automatically:
+- checks Docker GPU wiring,
+- builds the CUDA image,
+- installs dependencies,
+- runs `prepare.py` (data + tokenizer),
+- runs one training experiment.
+
+### 4) Re-run quickly
+
+After the first run, cached data/tokenizer are reused from `~/.cache/autoresearch`, so repeating is usually just:
+
+```bash
+bash scripts/run_wsl2_docker.sh
+```
+
+### 5) Low-VRAM tweaks (e.g. Quadro P620)
+
+The script defaults to:
+
+```bash
+TRAIN_ENV_VARS="AR_LOW_VRAM_PRESET=1 AR_DISABLE_COMPILE=1"
+```
+
+You can override manually:
+
+```bash
+TRAIN_ENV_VARS="AR_LOW_VRAM_PRESET=1 AR_DISABLE_COMPILE=1" bash scripts/run_wsl2_docker.sh
+```
+
+If you still hit OOM, reduce `MAX_SEQ_LEN` and `EVAL_TOKENS` in `prepare.py`, then run again.
+
+## Use a dataset other than the default climbmix
+
+The current downloader in `prepare.py` pulls from the default Hugging Face parquet URL (`BASE_URL`) and expects shards with a `text` column.
+
+Simple way to switch datasets:
+
+1. Pick a dataset and export/create parquet shards with a `text` column.
+2. Store shards in your cache data directory:
+   - default: `~/.cache/autoresearch/data`
+3. Keep one shard as validation (`VAL_FILENAME` logic in `prepare.py`).
+4. Update constants in `prepare.py` as needed:
+   - `BASE_URL`, `MAX_SHARD`, `VAL_SHARD`, `VOCAB_SIZE`
+5. Re-run:
+
+```bash
+uv run prepare.py
+uv run train.py
+```
+
+Practical tips for small GPUs:
+- lower `VOCAB_SIZE` in `prepare.py`,
+- lower `MAX_SEQ_LEN` and `EVAL_TOKENS` in `prepare.py`,
+- use `AR_LOW_VRAM_PRESET=1` when running `train.py`.
+
+
+### Concrete time-series workflow (predict future stream B from stream A)
+
+If your data is numeric and time-ordered, you can use this repo as a sequence forecaster by converting rows into text windows.
+
+1) Build autoresearch parquet shards from your CSV:
+
+```bash
+python scripts/build_timeseries_parquet.py   --input-csv /path/to/series.csv   --time-col timestamp   --source-col stream_a   --target-col stream_b   --context 32   --horizon 8
+```
+
+This writes:
+- `~/.cache/autoresearch/data/shard_00000.parquet` (train)
+- `~/.cache/autoresearch/data/shard_00001.parquet` (val)
+
+2) Set `MAX_SHARD=1` and `VAL_SHARD=1` in `prepare.py`, then run:
+
+```bash
+uv run prepare.py --num-shards 1
+uv run train.py
+```
+
+3) Create a predictions CSV with columns `y_true,y_pred` from your inference process and score it:
+
+```bash
+python scripts/eval_numeric_forecast.py --predictions-csv /path/to/preds.csv
+```
+
+Use `examples/program.timeseries.md` as a starter `program.md` for this forecasting task.
+
+## How to work on `program.md` (simple)
+
+Think of `program.md` as your research manager prompt for the coding agent.
+
+Recommended workflow:
+
+1. Start with one concrete goal (example: "reduce val_bpb without increasing OOM risk").
+2. Add hard constraints (time budget fixed, small diffs, avoid risky rewrites).
+3. Tell the agent exactly what to run each iteration (train once, compare metric, keep/revert).
+4. Ask for short experiment logs and rationale each iteration.
+5. Iterate `program.md` itself when behavior is not what you want.
+
+A simple template you can paste into `program.md`:
+
+```md
+# Goal
+Improve val_bpb in 5-minute runs on my hardware.
+
+# Constraints
+- Prefer stability over aggressive changes.
+- Keep diffs small and reversible.
+- Avoid changes that increase peak VRAM.
+
+# Loop
+1. Propose one small change in `train.py`.
+2. Run one experiment.
+3. Report: val_bpb, peak_vram_mb, tokens/sec.
+4. Keep the change only if val_bpb improves without memory regressions.
+5. Repeat.
+```
+
+
 ## Running the agent
 
 Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
