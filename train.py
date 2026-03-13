@@ -19,10 +19,19 @@ import torch.nn.functional as F
 
 try:
     from kernels import get_kernel
-except ImportError:
+except Exception:
     get_kernel = None
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+
+COMPILE_ENABLED = os.environ.get("AR_DISABLE_COMPILE", "0") != "1"
+
+
+def maybe_compile(fn):
+    if not COMPILE_ENABLED:
+        return fn
+    return torch.compile(dynamic=False, fullgraph=True)(fn)
+
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -41,6 +50,13 @@ class GPTConfig:
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
+
+
+def get_cuda_compute_dtype(device):
+    if device.type != "cuda":
+        return torch.bfloat16
+    major, _ = torch.cuda.get_device_capability(device)
+    return torch.bfloat16 if major >= 8 else torch.float16
 
 
 def has_ve(layer_idx, n_layer):
@@ -194,10 +210,11 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
+        # Keep embedding dtype aligned with actual CUDA support.
+        embed_dtype = get_cuda_compute_dtype(self.transformer.wte.weight.device)
+        self.transformer.wte.to(dtype=embed_dtype)
         for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+            ve.to(dtype=embed_dtype)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -207,7 +224,8 @@ class GPT(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
+        rotary_dtype = get_cuda_compute_dtype(device)
+        cos, sin = cos.to(dtype=rotary_dtype), sin.to(dtype=rotary_dtype)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
@@ -321,23 +339,31 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
+@maybe_compile
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
+    lr = lr_t.to(device=p.device, dtype=torch.float32)
+    wd = wd_t.to(device=p.device, dtype=torch.float32)
+    beta1 = beta1_t.to(device=grad.device, dtype=torch.float32)
+    beta2 = beta2_t.to(device=grad.device, dtype=torch.float32)
+    step = step_t.to(device=grad.device, dtype=torch.float32)
+    eps = eps_t.to(device=grad.device, dtype=torch.float32)
+    grad_f = grad.float()
+    p.mul_(1 - (lr * wd).to(dtype=p.dtype))
+    exp_avg.lerp_(grad_f, 1 - beta1)
+    exp_avg_sq.lerp_(grad_f.square(), 1 - beta2)
+    bias1 = 1 - beta1 ** step
+    bias2 = 1 - beta2 ** step
+    denom = (exp_avg_sq / bias2).sqrt() + eps
+    step_size = lr / bias1
+    update = (exp_avg / denom) * step_size
+    p.add_(update.to(dtype=p.dtype), alpha=-1)
 
-@torch.compile(dynamic=False, fullgraph=True)
+@maybe_compile
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    momentum = momentum_t.to(device=stacked_grads.device, dtype=torch.float32)
+    momentum_buffer.lerp_(stacked_grads, (1 - momentum).to(device=stacked_grads.device, dtype=torch.float32))
     g = stacked_grads.lerp_(momentum_buffer, momentum)
     # Polar express orthogonalization
     X = g.bfloat16()
@@ -354,12 +380,15 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
             X = a * X + B @ X
     g = X
     # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
+    beta2 = beta2_t.to(device=stacked_grads.device, dtype=torch.float32)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    second_momentum_buffer.lerp_(
+        v_mean.to(dtype=second_momentum_buffer.dtype),
+        (1 - beta2).to(device=second_momentum_buffer.device, dtype=torch.float32),
+    )
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
@@ -397,8 +426,8 @@ class MuonAdamW(torch.optim.Optimizer):
             state = self.state[p]
             if not state:
                 state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
+                state['exp_avg'] = torch.zeros_like(p, dtype=torch.float32)
+                state['exp_avg_sq'] = torch.zeros_like(p, dtype=torch.float32)
             state['step'] += 1
             self._adamw_step_t.fill_(state['step'])
             self._adamw_lr_t.fill_(group['lr'])
@@ -477,6 +506,13 @@ t_start = time.time()
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
+
+if not torch.cuda.is_available():
+    raise RuntimeError(
+        "CUDA is not available. This repo requires an NVIDIA GPU. "
+        "On WSL this usually means your installed PyTorch CUDA build is newer than your driver."
+    )
+
 device = torch.device("cuda")
 cap = torch.cuda.get_device_capability()
 major, minor = cap
@@ -494,7 +530,7 @@ else:
 ATTN_BACKEND = "fa3" if fa3 is not None else "sdpa"
 compute_dtype = torch.bfloat16 if major >= 8 else torch.float16
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=compute_dtype)
-USE_TORCH_COMPILE = os.environ.get("AR_DISABLE_COMPILE", "0") != "1" and major >= 7
+USE_TORCH_COMPILE = COMPILE_ENABLED and major >= 7
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 if os.environ.get("AR_LOW_VRAM_PRESET", "0") == "1":
@@ -506,6 +542,20 @@ if os.environ.get("AR_LOW_VRAM_PRESET", "0") == "1":
     WEIGHT_DECAY = 0.05
     DEPTH = 4
     DEVICE_BATCH_SIZE = 4
+
+if os.environ.get("AR_TINY_VRAM_PRESET", "0") == "1":
+    print("Applying AR_TINY_VRAM_PRESET hyperparameters")
+    ASPECT_RATIO = 32
+    HEAD_DIM = 64
+    WINDOW_PATTERN = "L"
+    TOTAL_BATCH_SIZE = 2**8
+    EMBEDDING_LR = 0.02
+    UNEMBEDDING_LR = 0.001
+    MATRIX_LR = 0.002
+    SCALAR_LR = 0.05
+    WEIGHT_DECAY = 0.0
+    DEPTH = 2
+    DEVICE_BATCH_SIZE = 1
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
