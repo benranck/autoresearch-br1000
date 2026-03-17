@@ -22,7 +22,13 @@ try:
 except Exception:
     get_kernel = None
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+import prepare
+from prepare import TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+
+# Override seq len for tiny GPU (prepare.py is read-only and has it hardcoded)
+MAX_SEQ_LEN = 256
+prepare.MAX_SEQ_LEN = MAX_SEQ_LEN
+prepare.EVAL_TOKENS = 524288
 
 COMPILE_ENABLED = False  # disabled for tiny GPU
 
