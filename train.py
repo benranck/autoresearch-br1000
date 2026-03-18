@@ -489,7 +489,7 @@ HEAD_DIM = 64           # target head dimension for attention
 WINDOW_PATTERN = "L"    # full attention only (no sliding window)
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**10 # 1024 tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**12 # 4096 tokens per optimizer step
 EMBEDDING_LR = 0.02     # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.001  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.002       # learning rate for matrix parameters (Muon)
